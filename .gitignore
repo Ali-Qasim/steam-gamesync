@@ -1,0 +1,17 @@
+# Secrets / per-machine config - NEVER commit
+.env
+names.json
+
+# Logs
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+Thumbs.db
+desktop.ini

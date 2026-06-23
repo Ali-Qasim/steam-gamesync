@@ -1,0 +1,6 @@
+vdf>=3.4
+requests>=2.31
+watchdog>=4.0
+python-dotenv>=1.0
+# Optional: desktop toast notifications (NOTIFICATIONS=true in .env)
+windows-toasts>=1.1; sys_platform == "win32"
