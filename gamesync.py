@@ -110,6 +110,19 @@ def detect_steam_path():
     return ""
 
 
+def detect_apollo_apps():
+    """Locate Apollo/Vibepollo apps.json (Sunshine-fork launch tiles)."""
+    for guess in (
+        r"C:\Program Files\Apollo\config\apps.json",
+        r"C:\Program Files\Vibepollo\config\apps.json",
+        r"C:\Program Files (x86)\Apollo\config\apps.json",
+        r"C:\Program Files (x86)\Vibepollo\config\apps.json",
+    ):
+        if os.path.isfile(guess):
+            return guess
+    return ""
+
+
 def load_name_overrides():
     if not os.path.isfile(NAMES_PATH):
         return {}
@@ -146,6 +159,11 @@ def load_config():
     cfg["steam_tag"] = (g("STEAM_TAG") or cfg["steam_tag"]).strip()
     cfg["notifications"] = _bool(g("NOTIFICATIONS"), False)
     cfg["name_overrides"] = load_name_overrides()
+
+    cfg["apollo_sync"] = _bool(g("APOLLO_SYNC"), True)
+    cfg["apollo_apps"] = (g("APOLLO_APPS", "") or "").strip() or detect_apollo_apps()
+    cfg["apollo_url"] = (g("APOLLO_URL", "") or "").strip() or "https://localhost:47990"
+    cfg["apollo_token"] = (g("APOLLO_REORDER_TOKEN", "") or g("APOLLO_TOKEN", "") or "").strip()
 
     if not cfg["games_dirs"]:
         raise RuntimeError("GAMES_DIRS is empty. Set it in .env (run install.py).")
@@ -407,6 +425,147 @@ def run_steamgrid(cfg):
         log(f"  steamgrid error: {ex}")
 
 
+# ----------------------------------------------------------------------------- apollo tiles
+def _apollo_uuid(exe):
+    """Deterministic uppercase GUID per game exe, so re-runs are stable."""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "gamesync:" + os.path.normcase(exe))).upper()
+
+
+def _grid_cover(grid, unsigned):
+    """Best cover art file in the Steam grid dir for a managed appid.
+    Prefer the portrait cover (<appid>p.png); avoid hero/logo."""
+    if not os.path.isdir(grid):
+        return ""
+    cands = [fn for fn in os.listdir(grid) if fn.startswith(str(unsigned))]
+
+    def rank(fn):
+        low = fn.lower()
+        if low.endswith(("p.png", "p.jpg")):
+            return 0
+        if "_hero" in low or "_logo" in low:
+            return 3
+        if low.endswith((".png", ".jpg")):
+            return 1
+        return 2
+
+    cands.sort(key=rank)
+    return os.path.join(grid, cands[0]) if cands else ""
+
+
+def reload_apollo(cfg):
+    """Force Apollo/Vibepollo to re-read apps.json in-memory WITHOUT a restart -
+    equivalent to the tray 'Reload Apps'. Uses POST /api/apps/reorder with an
+    empty order (lossless no-op: all apps are re-appended unchanged) which the
+    server follows with proc::refresh. Reloads only the app list, not running
+    streams, so it's safe to call mid-session."""
+    token = cfg.get("apollo_token")
+    if not token:
+        log("APOLLO_TOKEN not set - wrote apps.json but skipped live reload "
+            "(use Apollo tray 'Reload Apps' or set a token in .env).")
+        return
+    url = cfg.get("apollo_url", "https://localhost:47990").rstrip("/") + "/api/apps/reorder"
+    try:
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        r = requests.post(
+            url, json={"order": []},
+            headers={"Authorization": "Bearer " + token},
+            verify=False, timeout=15,
+        )
+        if r.status_code == 200:
+            log("Apollo app list reloaded (no restart).")
+        else:
+            log(f"Apollo reload failed: HTTP {r.status_code} {r.text[:200]}")
+    except Exception as ex:  # network/tls/etc - best-effort, never fatal
+        log(f"Apollo reload error: {ex}")
+
+
+def sync_apollo(cfg, kept, uid, dry=False):
+    """Mirror gamesync-managed shortcuts into Apollo/Vibepollo apps.json as
+    launch tiles. Only touches entries we own (marked gamesync-managed, or whose
+    cmd points inside a tracked games dir); user/preset tiles are left intact."""
+    if not cfg.get("apollo_sync", True):
+        return
+    path = cfg.get("apollo_apps")
+    if not path:
+        return
+    if not os.path.isfile(path):
+        log(f"Apollo apps.json not found ({path}); skipping tile sync.")
+        return
+
+    roots = games_roots(cfg)
+    grid = grid_dir(cfg, uid)
+
+    desired = {}
+    for e in kept:
+        if not is_managed(e):
+            continue
+        exe = strip_quotes(cft(e, "Exe"))
+        if not exe:
+            continue
+        name = cft(e, "AppName")
+        startdir = strip_quotes(cft(e, "StartDir")) or os.path.dirname(exe)
+        appid = cft(e, "appid", 0)
+        unsigned = appid & 0xFFFFFFFF if isinstance(appid, int) else 0
+        entry = {
+            "name": name,
+            "cmd": exe,
+            "working-dir": startdir,
+            "auto-detach": True,
+            "wait-all": True,
+            "exclude-global-prep-cmd": False,
+            "elevated": False,
+            "uuid": _apollo_uuid(exe),
+            "gamesync-managed": True,
+        }
+        img = _grid_cover(grid, unsigned)
+        if img:
+            entry["image-path"] = img
+        desired[os.path.normcase(exe)] = entry
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as ex:
+        log(f"Apollo apps.json unreadable ({ex}); skipping tile sync.")
+        return
+
+    apps = doc.get("apps", [])
+
+    def is_ours(a):
+        if a.get("gamesync-managed"):
+            return True
+        c = strip_quotes(a.get("cmd", ""))
+        return bool(c) and top_folder_of(c, roots) is not None
+
+    others = [a for a in apps if not is_ours(a)]
+    new_apps = others + list(desired.values())
+
+    def norm(lst):
+        return json.dumps(lst, sort_keys=True)
+
+    if norm(apps) == norm(new_apps):
+        return  # already in sync
+
+    log(f"Apollo tiles: {len(desired)} managed game(s), {len(others)} other tile(s).")
+    if dry:
+        log("  (dry run - apps.json not written)")
+        return
+
+    doc["apps"] = new_apps
+    try:
+        import shutil
+        shutil.copy2(path, path + ".gamesync.bak")
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=4)
+    log(f"Wrote Apollo apps.json ({len(new_apps)} tiles).")
+    reload_apollo(cfg)
+
+
 # ----------------------------------------------------------------------------- core reconcile
 def plan(cfg):
     roots = games_roots(cfg)
@@ -496,7 +655,7 @@ def plan(cfg):
         actions.append(("ADD", name, os.path.relpath(exe, folder_real)))
 
     changed = any(a[0] in ("REMOVE", "ADD", "ADOPT") for a in actions)
-    return data, kept, actions, changed, sc_path
+    return data, kept, actions, changed, sc_path, uid
 
 
 def write_shortcuts(data, kept, sc_path):
@@ -515,49 +674,48 @@ def write_shortcuts(data, kept, sc_path):
 def reconcile(cfg, dry=False):
     with _lock:
         try:
-            data, kept, actions, changed, sc_path = plan(cfg)
+            data, kept, actions, changed, sc_path, uid = plan(cfg)
         except (OSError, KeyError, ValueError, RuntimeError) as ex:
             log(f"ERROR during plan: {ex}")
             return
 
-        if not actions:
+        if actions:
+            for verb, name, detail in actions:
+                log(f"  {verb:<7} {name}  ({detail})")
+        else:
             log("No changes. Library in sync.")
-            return
-        for verb, name, detail in actions:
-            log(f"  {verb:<7} {name}  ({detail})")
 
         if dry:
-            log("Dry run - nothing written.")
-            return
-        if not changed:
-            return
-
-        running = steam_running()
-        if running and game_running():
-            log("A game is running - deferring write until Steam is idle.")
+            if actions:
+                log("Dry run - nothing written.")
+            sync_apollo(cfg, kept, uid, dry=True)
             return
 
-        did_shutdown = False
-        if running and cfg.get("restart_steam_when_idle", True):
-            did_shutdown = shutdown_steam(cfg)
-            if not did_shutdown:
-                log("Could not close Steam cleanly; deferring.")
-                return
+        if changed:
+            running = steam_running()
+            if running and game_running():
+                log("A game is running - deferring Steam write until idle.")
+            else:
+                did_shutdown = False
+                if running and cfg.get("restart_steam_when_idle", True):
+                    did_shutdown = shutdown_steam(cfg)
+                if running and cfg.get("restart_steam_when_idle", True) and not did_shutdown:
+                    log("Could not close Steam cleanly; deferring Steam write.")
+                else:
+                    write_shortcuts(data, kept, sc_path)
+                    log(f"Wrote shortcuts.vdf ({len(kept)} shortcuts).")
+                    for verb, name, _ in actions:
+                        if verb == "ADD":
+                            notify("Game added to Steam", name, cfg)
+                        elif verb == "REMOVE":
+                            notify("Shortcut removed", name, cfg)
+                    if did_shutdown:
+                        launch_steam(cfg)
+                    run_steamgrid(cfg)
+                    log("Reconcile complete.")
 
-        write_shortcuts(data, kept, sc_path)
-        log(f"Wrote shortcuts.vdf ({len(kept)} shortcuts).")
-
-        for verb, name, _ in actions:
-            if verb == "ADD":
-                notify("Game added to Steam", name, cfg)
-            elif verb == "REMOVE":
-                notify("Shortcut removed", name, cfg)
-
-        if did_shutdown:
-            launch_steam(cfg)
-
-        run_steamgrid(cfg)
-        log("Reconcile complete.")
+        # Apollo tiles don't depend on Steam being closed - always keep them in sync.
+        sync_apollo(cfg, kept, uid)
 
 
 # ----------------------------------------------------------------------------- status
@@ -579,6 +737,20 @@ def status(cfg):
         art = "art" if has_art else "NO ART"
         print(f"  [{art:>6}] {cft(e, 'AppName')}")
         print(f"            {strip_quotes(cft(e, 'Exe'))}")
+
+    ap = cfg.get("apollo_apps")
+    if cfg.get("apollo_sync", True) and ap and os.path.isfile(ap):
+        try:
+            with open(ap, encoding="utf-8") as f:
+                doc = json.load(f)
+            roots = games_roots(cfg)
+            mine = [a for a in doc.get("apps", [])
+                    if a.get("gamesync-managed")
+                    or top_folder_of(strip_quotes(a.get("cmd", "")), roots) is not None]
+            print(f"\nApollo tiles (managed): {len(mine)}")
+            print(f"            {ap}")
+        except (OSError, ValueError):
+            pass
 
 
 # ----------------------------------------------------------------------------- watch mode
