@@ -112,14 +112,18 @@ def detect_steam_path():
 
 def detect_apollo_apps():
     """Locate Apollo/Vibepollo apps.json (Sunshine-fork launch tiles)."""
-    for guess in (
-        r"C:\Program Files\Apollo\config\apps.json",
-        r"C:\Program Files\Vibepollo\config\apps.json",
-        r"C:\Program Files (x86)\Apollo\config\apps.json",
-        r"C:\Program Files (x86)\Vibepollo\config\apps.json",
+    # Vibepollo (and Apollo) often install over/as "Sunshine", so the config
+    # lands in a Sunshine-named folder; probe those too. ProgramData is a common
+    # install target as well.
+    for base in (
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
     ):
-        if os.path.isfile(guess):
-            return guess
+        for name in ("Apollo", "Vibepollo", "Sunshine"):
+            guess = os.path.join(base, name, "config", "apps.json")
+            if os.path.isfile(guess):
+                return guess
     return ""
 
 
@@ -573,8 +577,11 @@ def plan(cfg):
     sc_path = shortcuts_path(cfg, uid)
     tag = cfg.get("steam_tag", "")
 
-    with open(sc_path, "rb") as f:
-        data = vdf.binary_load(f)
+    if os.path.isfile(sc_path):
+        with open(sc_path, "rb") as f:
+            data = vdf.binary_load(f)
+    else:
+        data = {"shortcuts": {}}
     shortcuts = data.get("shortcuts", {})
     entries = list(shortcuts.values())
 
@@ -724,8 +731,11 @@ def status(cfg):
     sc_path = shortcuts_path(cfg, uid)
     gdir = grid_dir(cfg, uid)
     grid_files = os.listdir(gdir) if os.path.isdir(gdir) else []
-    with open(sc_path, "rb") as f:
-        data = vdf.binary_load(f)
+    if os.path.isfile(sc_path):
+        with open(sc_path, "rb") as f:
+            data = vdf.binary_load(f)
+    else:
+        data = {"shortcuts": {}}
     managed = [e for e in data.get("shortcuts", {}).values() if is_managed(e)]
     print(f"Tracked dirs : {', '.join(games_dirs(cfg))}")
     print(f"Steam account: {uid}")
